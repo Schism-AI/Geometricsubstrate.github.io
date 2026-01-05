@@ -1,0 +1,517 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import * as THREE from 'three';
+
+/**
+ * SHD-CCP Strassen-Clifford Kernel Walkthrough v3.0
+ * Features: Coaxial Multi-Manifold (L0-L3), Inverse Projection, and Calibration Targets.
+ */
+
+// --- Constants ---
+const PI = Math.PI;
+const TAU = 2 * PI;
+
+// --- 3D Geometry Helpers ---
+
+// Trefoil Knot with Layer Support (L0 - L3) and Inverse Projection
+const getTrefoilPoint = (t, radius = 2.5, tubeRadius = 0.5, offsetPhase = 0, layer = 0, isInverse = false, noiseLevel = 0) => {
+  // Base Curve (Harmonic Trefoil)
+  let x = Math.sin(t) + 2 * Math.sin(2 * t);
+  let y = Math.cos(t) - 2 * Math.cos(2 * t);
+  let z = -Math.sin(3 * t);
+  
+  // Stochastic Noise
+  if (noiseLevel > 0) {
+      x += (Math.random() - 0.5) * noiseLevel;
+      y += (Math.random() - 0.5) * noiseLevel;
+      z += (Math.random() - 0.5) * noiseLevel;
+  }
+
+  const p = new THREE.Vector3(x * radius, y * radius, z * radius);
+  
+  // Frenet Frame
+  const t_next = t + 0.01;
+  const x_n = Math.sin(t_next) + 2 * Math.sin(2 * t_next);
+  const y_n = Math.cos(t_next) - 2 * Math.cos(2 * t_next);
+  const z_n = -Math.sin(3 * t_next);
+  const p_next = new THREE.Vector3(x_n * radius, y_n * radius, z_n * radius);
+  
+  const T = new THREE.Vector3().subVectors(p_next, p).normalize();
+  const up = new THREE.Vector3(0, 0, 1);
+  const N = new THREE.Vector3().crossVectors(T, up).normalize();
+  const B = new THREE.Vector3().crossVectors(T, N).normalize();
+  
+  // Twist Logic: 720 degree rotation (4PI) over the knot
+  const twist = 2 * t + offsetPhase; 
+  
+  // Layer Logic:
+  // L0 = Core (0 offset)
+  // L1 = Inner (tubeRadius)
+  // L2 = Mid (tubeRadius * 1.5)
+  // L3 = Outer (tubeRadius * 2.0)
+  let layerOffset = 0;
+  if (layer === 0) layerOffset = 0;
+  if (layer === 1) layerOffset = tubeRadius;
+  if (layer === 2) layerOffset = tubeRadius * 1.5;
+  if (layer === 3) layerOffset = tubeRadius * 2.2;
+
+  // Inverse Logic: Flip the normal vector phase by PI (180 degrees)
+  const finalTwist = isInverse ? twist + PI : twist;
+
+  const N_rot = N.clone().multiplyScalar(Math.cos(finalTwist)).add(B.clone().multiplyScalar(Math.sin(finalTwist)));
+  
+  // If L0, return just the point (no radius offset)
+  if (layer === 0) return p;
+
+  return p.add(N_rot.multiplyScalar(layerOffset));
+};
+
+// --- Components ---
+
+// 1. Kernel Visualizer: The 8x8 Bit-Field
+const KernelVisualizer = ({ mode, time }) => {
+  
+  const grid = useMemo(() => {
+    const cells = [];
+    for(let i=0; i<64; i++) {
+      const r = Math.floor(i/8);
+      const c = i%8;
+      let label = '';
+      let color = 'bg-slate-800';
+      let opacity = 1;
+      
+      if (mode === 'STANDARD') {
+        if (r === 0) { color = 'bg-violet-900'; label='SF'; }
+        else if (r === 7) { color = 'bg-blue-900'; label='FREQ'; }
+        else if (r === 1 || r === 6) { color = 'bg-emerald-900'; label='PL'; }
+        else { 
+            color = 'bg-pink-600'; 
+            if (c < 4) opacity = 0.8; else opacity = 1; 
+            label = 'Q';
+        }
+      } 
+      else if (mode === 'HOLOGRAPHIC') {
+        if (r === 0) { color = 'bg-slate-600'; label='HDR'; }
+        else if (r === 7) { color = 'bg-slate-600'; label='FTR'; }
+        // L2 Real vs L2 Inverse visualization
+        else if (r >= 1 && r <= 3) { color = 'bg-cyan-600'; label = `R${(r-1)*8 + c}`; }
+        else if (r >= 4 && r <= 6) { color = 'bg-purple-600'; label = `I${(r-4)*8 + c}`; }
+      } 
+      else if (mode === 'COSMO_KEY') {
+        // Visualizing the 4 Layers
+        if (r === 0) {
+            if (c < 4) { color = 'bg-yellow-500'; label='L0'; } // SF -> L0
+            else { color = 'bg-orange-500'; label='L0'; }
+        }
+        else if (r === 7) {
+            if (c < 4) { color = 'bg-indigo-500'; label='L0'; }
+            else { color = 'bg-teal-500'; label='L0'; }
+        }
+        else if (r === 1 || r === 6) { color = 'bg-slate-700'; label='BUF'; }
+        else {
+            if (r === 2) { color = 'bg-gray-200 text-black'; label='L1'; } // Energy
+            if (r === 3) { color = 'bg-red-600'; label='L2'; } // Chords
+            if (r === 4) { color = 'bg-green-600'; label='L3'; } // Subpoly
+            if (r === 5) { color = 'bg-blue-600'; label='L3'; } // Shaving
+        }
+      }
+      else if (mode === 'LOOPSPACE') {
+        const val = Math.sin((i / 64) * TAU + time * 2);
+        const hue = (val + 1) * 180; 
+        label = 'C' + i;
+        opacity = 0.8 + (val * 0.2);
+        color = 'bg-slate-700';
+      }
+      else if (mode === 'STOCHASTIC') {
+        if (r === 0 || r === 7) {
+             color = 'bg-slate-700'; label = 'LOCK';
+        } else {
+             const rnd = Math.random();
+             if (rnd > 0.8) color = 'bg-white text-black';
+             else if (rnd > 0.5) color = 'bg-gray-500';
+             else color = 'bg-black';
+             label = rnd > 0.5 ? '1' : '0';
+        }
+      }
+      
+      const pulse = Math.sin(time * 8 + r - c) > 0.2;
+      
+      cells.push({ r, c, color, label, opacity, pulse, index: i });
+    }
+    return cells;
+  }, [mode, time]);
+
+  return (
+    <div className="relative group">
+        <div className="grid grid-cols-8 gap-px w-64 h-64 bg-slate-900 border-4 border-slate-800 p-1 shadow-2xl">
+        {grid.map((cell, idx) => (
+            <div 
+            key={idx} 
+            className={`flex items-center justify-center text-[7px] font-mono font-bold transition-all duration-75 ${mode !== 'LOOPSPACE' ? cell.color : ''}`}
+            style={{ 
+                backgroundColor: mode === 'LOOPSPACE' ? `hsl(${(cell.index/64 * 360 + time*100)%360}, 70%, 50%)` : undefined,
+                opacity: cell.pulse ? cell.opacity : 0.4,
+                color: (mode === 'STOCHASTIC' && cell.color.includes('text-black')) ? 'black' : 'white',
+            }}
+            >
+            {cell.label}
+            </div>
+        ))}
+        </div>
+        {mode === 'COSMO_KEY' && (
+            <>
+                <div className="absolute -left-8 top-2 text-[8px] text-yellow-500 font-mono">LAYER 0</div>
+                <div className="absolute -left-8 top-20 text-[8px] text-gray-400 font-mono">L1-L3</div>
+                <div className="absolute -left-8 bottom-2 text-[8px] text-indigo-500 font-mono">LAYER 0</div>
+            </>
+        )}
+    </div>
+  );
+};
+
+// 2. Topological View: Coaxial Manifold
+const TopologicalView = ({ time, mode, pathId }) => {
+  const mountRef = useRef(null);
+  const rendererRef = useRef(null);
+  
+  useEffect(() => {
+    if (!mountRef.current) return;
+    
+    const w = mountRef.current.clientWidth;
+    const h = mountRef.current.clientHeight;
+    
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#020617');
+    
+    const camera = new THREE.PerspectiveCamera(45, w/h, 0.1, 100);
+    camera.position.set(0, 0, 18);
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(w, h);
+    mountRef.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+    
+    const amb = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(amb);
+    const spot = new THREE.SpotLight(0xffffff, 1);
+    spot.position.set(10, 10, 10);
+    scene.add(spot);
+
+    const group = new THREE.Group();
+    scene.add(group);
+
+    // --- GEOMETRY GENERATION ---
+    const streams = [];
+    const steps = 120; // Resolution
+
+    // Function to add a single stream
+    const addStream = (config) => {
+        const points = [];
+        for(let j=0; j<=steps; j++) {
+            const t = (j/steps) * TAU;
+            points.push(getTrefoilPoint(t, 2.8, config.radius, config.phase, config.layer, config.isInverse, config.noise));
+        }
+        const path = new THREE.CatmullRomCurve3(points);
+        const geo = new THREE.TubeGeometry(path, 100, config.thickness, 6, true);
+        const mat = new THREE.MeshStandardMaterial({ 
+            color: config.color,
+            transparent: true,
+            opacity: config.opacity,
+            wireframe: config.wireframe || false,
+            emissive: config.color,
+            emissiveIntensity: 0.3
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        group.add(mesh);
+        streams.push(mesh);
+    };
+
+    // --- MODE LOGIC ---
+
+    if (mode === 'STANDARD') {
+        // L1 Only (16 streams)
+        for(let i=0; i<16; i++) {
+            addStream({
+                layer: 1,
+                radius: 0.5,
+                phase: (i/16)*TAU,
+                color: 0xdb2777, // Pink
+                thickness: 0.03,
+                opacity: 0.8
+            });
+        }
+    }
+    else if (mode === 'HOLOGRAPHIC') {
+        // L2 Real (Cyan) + L2 Inverse (Purple)
+        // 12 Real Streams
+        for(let i=0; i<12; i++) {
+            addStream({
+                layer: 2,
+                radius: 0.6,
+                phase: (i/12)*TAU,
+                color: 0x06b6d4, // Cyan
+                thickness: 0.03,
+                opacity: 0.9,
+                isInverse: false
+            });
+        }
+        // 12 Inverse Streams (Antipodal/Conjugate)
+        for(let i=0; i<12; i++) {
+            addStream({
+                layer: 2,
+                radius: 0.6,
+                phase: (i/12)*TAU, // Same phase, but getTrefoilPoint handles the inversion
+                color: 0x9333ea, // Purple
+                thickness: 0.02,
+                opacity: 0.5,
+                isInverse: true,
+                wireframe: true // Visual distinction for Ghost/Inverse
+            });
+        }
+    }
+    else if (mode === 'COSMO_KEY') {
+        // Full Stack L0, L1, L2, L3
+        
+        // L0: Core Control (Gold) - Single thin spine
+        addStream({ layer: 0, radius: 0, phase: 0, color: 0xfacc15, thickness: 0.08, opacity: 1.0 });
+
+        // L1: Energy (White/Gray) - 6 streams
+        for(let i=0; i<6; i++) addStream({ layer: 1, radius: 0.4, phase: (i/6)*TAU, color: 0xffffff, thickness: 0.04, opacity: 0.8 });
+
+        // L2: Chords (Red) - 8 streams
+        for(let i=0; i<8; i++) addStream({ layer: 2, radius: 0.6, phase: (i/8)*TAU + 0.1, color: 0xdc2626, thickness: 0.03, opacity: 0.6 });
+
+        // L3: Shaving (Blue) - 10 streams
+        for(let i=0; i<10; i++) addStream({ layer: 3, radius: 0.8, phase: (i/10)*TAU + 0.2, color: 0x2563eb, thickness: 0.02, opacity: 0.4, wireframe: true });
+    }
+    else if (mode === 'LOOPSPACE') {
+        // Single continuous high-res L2
+        addStream({ layer: 2, radius: 0.7, phase: 0, color: 0x10b981, thickness: 0.15, opacity: 0.7 });
+    }
+    else if (mode === 'STOCHASTIC') {
+        // L1 with Noise
+        for(let i=0; i<16; i++) addStream({ layer: 1, radius: 0.5, phase: (i/16)*TAU, color: 0xffffff, thickness: 0.02, opacity: 0.5, noise: 0.15 });
+    }
+
+    // --- CALIBRATION TARGETS (Rings) ---
+    // Visual indicators at specific t intervals (Strassen steps)
+    const targets = [];
+    for(let k=0; k<7; k++) {
+        const t = (k/7) * TAU;
+        const pos = getTrefoilPoint(t, 2.8, 0, 0, 0); // L0 position
+        
+        const ringGeo = new THREE.TorusGeometry(0.8, 0.02, 8, 24);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        
+        ring.position.copy(pos);
+        ring.lookAt(new THREE.Vector3(0,0,0)); // Just orient generally inwards
+        group.add(ring);
+    }
+
+    let frameId;
+    const animate = () => {
+      group.rotation.y += 0.002;
+      group.rotation.z = Math.sin(Date.now()*0.0005)*0.1;
+      renderer.render(scene, camera);
+      frameId = requestAnimationFrame(animate);
+    };
+    animate();
+
+    return () => {
+        cancelAnimationFrame(frameId);
+        if (mountRef.current && renderer.domElement) mountRef.current.removeChild(renderer.domElement);
+        renderer.dispose();
+    };
+  }, [mode, pathId]);
+
+  return <div ref={mountRef} className="w-full h-full rounded-lg bg-black" />;
+};
+
+// --- DATA ---
+
+const STRASSEN_PATHS = [
+    { id: 'M1', name: 'Core Cycle', math: '(A+D)(E+H)', desc: 'Fundamental recursive step.' },
+    { id: 'M2', name: 'Lower Halo', math: '(C+D)E', desc: 'Lower quadrant interaction.' },
+    { id: 'M3', name: 'Upper Halo', math: 'A(F-H)', desc: 'Upper facet processing.' },
+    { id: 'M4', name: 'Diagonal Twist', math: 'D(G-E)', desc: 'Diagonal stream crossing.' },
+    { id: 'M5', name: 'Parity Mixing', math: '(A+B)H', desc: 'Entropy injection.' },
+    { id: 'M6', name: 'Shaving A', math: '(C+D)(E-G)', desc: 'Submodular inequality check.' },
+    { id: 'M7', name: 'Shaving B', math: '(B-D)(G+H)', desc: 'Unitarity correction.' },
+];
+
+const PACKET_TYPES = {
+    'STANDARD': {
+        title: 'Standard (Local)',
+        desc: '16-Stream L1 Bundle. Adjacent communication.',
+        latency: 'Low',
+        useCase: 'Thread Clusters'
+    },
+    'HOLOGRAPHIC': {
+        title: 'Holographic (System)',
+        desc: 'L2 Real + L2 Inverse. Non-local interference broadcast.',
+        latency: 'Medium',
+        useCase: 'Scalar Waves'
+    },
+    'COSMO_KEY': {
+        title: 'Cosmohedra (Universal)',
+        desc: 'Full Stack L0-L3. Nested Russian Doll geometry. The Key.',
+        latency: 'O(1) Lookup',
+        useCase: 'Admin / Watcher'
+    },
+    'LOOPSPACE': {
+        title: 'High-Precision (Loopspace)',
+        desc: 'Continuous Homotopy Loop on L2.',
+        latency: 'Variable',
+        useCase: 'High-Res Verification'
+    },
+    'STOCHASTIC': {
+        title: 'Open Stochastic (Noise)',
+        desc: 'Geometric Noise generation on L1.',
+        latency: 'High',
+        useCase: 'Entropy Generation'
+    }
+};
+
+// --- Main Application ---
+
+export default function StrassenLoopspaceWalkthrough() {
+  const [selectedPath, setSelectedPath] = useState('M1');
+  const [packetMode, setPacketMode] = useState('COSMO_KEY');
+  const [time, setTime] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => setTime(t => (t + 0.01) % TAU), 16);
+    return () => clearInterval(interval);
+  }, []);
+
+  const currentPacket = PACKET_TYPES[packetMode];
+  const currentPath = STRASSEN_PATHS.find(p => p.id === selectedPath);
+
+  return (
+    <div className="flex h-screen bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200 overflow-hidden font-sans">
+      <nav className="w-64 bg-slate-100 dark:bg-slate-950 border-r border-slate-200 dark:border-slate-800 flex flex-col">
+        <div className="p-6 border-b border-slate-200 dark:border-slate-800">
+            <h1 className="text-sm font-bold uppercase tracking-widest text-indigo-500">Strassen-Clifford</h1>
+            <div className="text-xs text-slate-500 mt-1">v3.0: Coaxial Layers</div>
+        </div>
+        <div className="p-4 overflow-y-auto max-h-[50vh]">
+            <div className="text-xs font-bold text-slate-400 mb-2 uppercase">Packet Architecture</div>
+            <div className="space-y-2">
+                {Object.keys(PACKET_TYPES).map(mode => (
+                    <button
+                        key={mode}
+                        onClick={() => setPacketMode(mode)}
+                        className={`w-full text-left px-3 py-2 rounded text-xs font-medium transition-all ${packetMode === mode ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-200 dark:bg-slate-900 hover:bg-slate-300 dark:hover:bg-slate-800'}`}
+                    >
+                        {PACKET_TYPES[mode].title}
+                    </button>
+                ))}
+            </div>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 border-t border-slate-200 dark:border-slate-800">
+            <div className="text-xs font-bold text-slate-400 mb-2 uppercase">Strassen Paths</div>
+            <div className="space-y-1">
+                {STRASSEN_PATHS.map(path => (
+                    <button
+                        key={path.id}
+                        onClick={() => setSelectedPath(path.id)}
+                        className={`w-full flex items-center justify-between px-3 py-2 rounded text-xs border transition-all ${selectedPath === path.id ? 'bg-white dark:bg-slate-800 border-indigo-500 shadow-sm' : 'border-transparent hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500'}`}
+                    >
+                        <span className="font-mono font-bold">{path.id}</span>
+                        <span className="text-[10px] opacity-70">{path.math}</span>
+                    </button>
+                ))}
+            </div>
+        </div>
+      </nav>
+
+      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        <header className="h-16 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-8 bg-white dark:bg-slate-900">
+            <div>
+                <h2 className="text-lg font-bold text-slate-900 dark:text-white">
+                    {selectedPath}: {currentPath.name}
+                </h2>
+                <div className="flex gap-2 text-xs font-mono mt-1">
+                    <span className="text-slate-500">Mode:</span>
+                    <span className={`font-bold ${packetMode === 'COSMO_KEY' ? 'text-amber-500' : 'text-indigo-500'}`}>
+                        {currentPacket.title}
+                    </span>
+                </div>
+            </div>
+            <div className="text-right">
+                <div className="text-xs font-bold uppercase text-slate-400">Layer Depth</div>
+                <div className="text-sm font-mono text-slate-600 dark:text-slate-300">
+                    {packetMode === 'COSMO_KEY' ? 'L0 + L1 + L2 + L3' : packetMode === 'HOLOGRAPHIC' ? 'L2 (Real + Inv)' : 'L1 Only'}
+                </div>
+            </div>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-8">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 h-full">
+                <div className="flex flex-col gap-6">
+                    <div className="aspect-square bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800 relative group">
+                        <TopologicalView time={time} mode={packetMode} pathId={selectedPath} />
+                        <div className="absolute bottom-4 left-4 text-xs font-mono text-white/50 bg-black/50 px-2 rounded">
+                            Strassen Targets: 7 (Yellow Rings)
+                        </div>
+                    </div>
+                    <div className="bg-slate-100 dark:bg-slate-800 p-6 rounded-xl border border-slate-200 dark:border-slate-700 flex flex-col items-center shadow-lg">
+                        <div className="w-full flex justify-between items-center mb-4">
+                            <h3 className="text-sm font-bold uppercase text-slate-500">Kernel State</h3>
+                            <span className="text-xs font-mono bg-slate-200 dark:bg-slate-700 px-2 py-0.5 rounded text-slate-600 dark:text-slate-300">
+                                {packetMode === 'STOCHASTIC' ? 'ENTROPY' : '64-BIT'}
+                            </span>
+                        </div>
+                        <KernelVisualizer mode={packetMode} time={time} />
+                    </div>
+                </div>
+
+                <div className="space-y-8">
+                    <section>
+                        <h3 className="text-xl font-bold text-slate-900 dark:text-white mb-3">Mathematical Context</h3>
+                        <div className="p-4 bg-white dark:bg-slate-800 rounded-lg border-l-4 border-indigo-500 shadow-sm text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+                            {packetMode === 'COSMO_KEY' && (
+                                <p>
+                                    <strong>The Key Protocol:</strong> Fully exploits the coaxial topology. 
+                                    L0 (Gold) carries control pointers. L1-L3 (White/Red/Blue) carry the nested quaternion data. 
+                                    This structure allows O(1) lookup by referencing the specific shell radius.
+                                </p>
+                            )}
+                            {packetMode === 'HOLOGRAPHIC' && (
+                                <p>
+                                    <strong>Inverse Projection:</strong> Splits data into Real (Cyan) and Inverse (Purple) streams on Layer 2. 
+                                    The Inverse stream is phase-shifted by 180° ($\pi$), creating a standing wave interference pattern used for non-local broadcast.
+                                </p>
+                            )}
+                            {(packetMode === 'STANDARD' || packetMode === 'LOOPSPACE' || packetMode === 'STOCHASTIC') && (
+                                <p>
+                                    {currentPacket.desc}
+                                </p>
+                            )}
+                        </div>
+                    </section>
+
+                    <section>
+                        <h3 className="text-sm font-bold uppercase tracking-wider text-slate-500 mb-4 border-b border-slate-200 dark:border-slate-700 pb-2">
+                            Implementation Details
+                        </h3>
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded border border-slate-200 dark:border-slate-700">
+                                <div className="text-[10px] uppercase text-slate-400 font-bold">Latency</div>
+                                <div className="text-lg font-mono text-emerald-500">{currentPacket.latency}</div>
+                            </div>
+                            <div className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded border border-slate-200 dark:border-slate-700">
+                                <div className="text-[10px] uppercase text-slate-400 font-bold">Topology</div>
+                                <div className="text-sm font-mono text-slate-700 dark:text-slate-300">
+                                    {packetMode === 'COSMO_KEY' ? 'Coaxial Nested' : 'Single/Split Layer'}
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+      </main>
+    </div>
+  );
+}
